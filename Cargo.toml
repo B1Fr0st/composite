@@ -1,0 +1,18 @@
+[package]
+name = "newoverlay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+imgui = "0.8"
+imgui-dx9-renderer = "0.8"
+wio = "0.2"
+
+[dependencies.winapi]
+version = "0.3"
+features = [
+    "d3d9",
+    "d3d9types",
+    "winuser",
+    "libloaderapi",
+]
