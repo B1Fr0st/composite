@@ -299,4 +299,83 @@ impl Overlay {
         self.resize_width = width;
         self.resize_height = height;
     }
+
+    /// Add a custom font to the ImGui context
+    ///
+    /// # Arguments
+    /// * `font_sources` - Array of FontSource configurations to add
+    ///
+    /// # Example
+    /// ```no_run
+    /// use imgui::FontSource;
+    ///
+    /// let font_data = include_bytes!("../path/to/font.ttf");
+    /// overlay.add_fonts(&[
+    ///     FontSource::TtfData {
+    ///         data: font_data,
+    ///         size_pixels: 18.0,
+    ///         config: None,
+    ///     }
+    /// ]);
+    /// ```
+    pub fn add_fonts(&mut self, font_sources: &[FontSource]) -> bool {
+        // Clear existing fonts and add new ones
+        let fonts = self.imgui.fonts();
+
+        // Add the new fonts
+        for source in font_sources {
+            fonts.add_font(&[source.clone()]);
+        }
+
+        // Rebuild the renderer with the new font atlas
+        self.rebuild_renderer()
+    }
+
+    /// Rebuild the ImGui renderer (useful after font changes)
+    fn rebuild_renderer(&mut self) -> bool {
+        // Drop existing renderer
+        self.renderer = None;
+
+        // Recreate renderer with updated font atlas
+        match unsafe { Renderer::new(&mut self.imgui, self.device.clone().unwrap()) } {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                true
+            }
+            Err(e) => {
+                eprintln!("Failed to rebuild ImGui renderer: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Get mutable access to the ImGui context for advanced font configuration
+    ///
+    /// # Example
+    /// ```no_run
+    /// use imgui::{FontSource, FontConfig, FontGlyphRanges};
+    ///
+    /// overlay.configure_fonts(|imgui| {
+    ///     let font_data = include_bytes!("../font.ttf");
+    ///     let mut config = FontConfig::default();
+    ///     config.oversample_h = 2;
+    ///     config.oversample_v = 2;
+    ///
+    ///     imgui.fonts().add_font(&[FontSource::TtfData {
+    ///         data: font_data,
+    ///         size_pixels: 16.0,
+    ///         config: Some(config),
+    ///     }]);
+    /// });
+    /// ```
+    pub fn configure_fonts<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut Context),
+    {
+        // Allow user to configure fonts
+        f(&mut self.imgui);
+
+        // Rebuild renderer with new font atlas
+        self.rebuild_renderer()
+    }
 }
