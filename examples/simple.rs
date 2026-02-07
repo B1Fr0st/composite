@@ -20,6 +20,55 @@ fn main() {
 
         // Render UI
         overlay.render(|ui| {
+            // Get background draw list (draws behind windows)
+            let draw_list = ui.get_background_draw_list();
+
+            // Draw a line
+            draw_list
+                .add_line([100.0, 100.0], [300.0, 100.0], [1.0, 0.0, 0.0, 1.0])
+                .thickness(2.0)
+                .build();
+
+            // Draw a rectangle (filled)
+            draw_list.add_rect(
+                [100.0, 120.0],
+                [300.0, 220.0],
+                [0.0, 1.0, 0.0, 0.5] // Green with 50% alpha
+            )
+            .filled(true)
+            .build();
+
+            // Draw a rectangle (outline)
+            draw_list.add_rect(
+                [100.0, 120.0],
+                [300.0, 220.0],
+                [0.0, 1.0, 0.0, 1.0]
+            )
+            .thickness(2.0)
+            .build();
+
+            // Draw a circle (filled)
+            draw_list.add_circle(
+                [450.0, 170.0],
+                50.0,
+                [1.0, 1.0, 0.0, 0.5] // Yellow with 50% alpha
+            )
+            .filled(true)
+            .build();
+
+            // Draw a circle (outline)
+            draw_list.add_circle(
+                [450.0, 170.0],
+                50.0,
+                [1.0, 1.0, 0.0, 1.0]
+            )
+            .thickness(2.0)
+            .build();
+
+            // Draw text without a window
+            draw_list.add_text([100.0, 240.0], [1.0, 1.0, 1.0, 1.0], "Direct text rendering!");
+
+            // Optional: Show debug window
             Window::new("Overlay")
                 .size([300.0, 250.0], Condition::FirstUseEver)
                 .build(ui, || {
