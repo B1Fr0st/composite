@@ -11,7 +11,6 @@ use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
 use winapi::shared::winerror::*;
 use winapi::um::winuser::*;
-use winapi::um::libloaderapi::GetModuleHandleA;
 
 // D3D9 error codes
 const D3DERR_DEVICELOST: i32 = 0x88760868_u32 as i32;
@@ -36,17 +35,17 @@ impl Overlay {
         // Find Discord Overlay window
         let hwnd = unsafe {
             FindWindowA(
-                b"UnityWndClass\0".as_ptr() as *const i8,
-                b"BongoCat\0".as_ptr() as *const i8,
+                b"Chrome_WidgetWin_1\0".as_ptr() as *const i8,
+                b"Discord Overlay\0".as_ptr() as *const i8,
             )
         };
 
         if hwnd.is_null() {
-            eprintln!("Failed to find bongocat window");
+            eprintln!("Failed to find discord window");
             return None;
         }
 
-        println!("Found bongocat window: {:?}", hwnd);
+        println!("Found discord window: {:?}", hwnd);
 
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
@@ -230,7 +229,6 @@ impl Overlay {
             ScreenToClient(self.hwnd, &mut cursor_pos);
             self.mouse_pos = [cursor_pos.x as f32, cursor_pos.y as f32];
 
-            // Poll mouse button states using GetAsyncKeyState
             // High bit indicates if key is down
             self.mouse_buttons[0] = (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0;
             self.mouse_buttons[1] = (GetAsyncKeyState(VK_RBUTTON) as u16 & 0x8000) != 0;
