@@ -11,6 +11,7 @@ use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
 use winapi::shared::winerror::*;
 use winapi::um::winuser::*;
+use winapi::um::libloaderapi::GetModuleHandleA;
 
 // D3D9 error codes
 const D3DERR_DEVICELOST: i32 = 0x88760868_u32 as i32;
@@ -26,6 +27,8 @@ pub struct Overlay {
     resize_width: u32,
     resize_height: u32,
     last_frame: Instant,
+    mouse_pos: [f32; 2],
+    mouse_buttons: [bool; 5],
 }
 
 impl Overlay {
@@ -33,17 +36,17 @@ impl Overlay {
         // Find Discord Overlay window
         let hwnd = unsafe {
             FindWindowA(
-                b"Chrome_WidgetWin_1\0".as_ptr() as *const i8,
-                b"Discord Overlay\0".as_ptr() as *const i8,
+                b"UnityWndClass\0".as_ptr() as *const i8,
+                b"BongoCat\0".as_ptr() as *const i8,
             )
         };
 
         if hwnd.is_null() {
-            eprintln!("Failed to find Discord Overlay window");
+            eprintln!("Failed to find bongocat window");
             return None;
         }
 
-        println!("Found Discord Overlay window: {:?}", hwnd);
+        println!("Found bongocat window: {:?}", hwnd);
 
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
@@ -58,6 +61,8 @@ impl Overlay {
             resize_width: 0,
             resize_height: 0,
             last_frame: Instant::now(),
+            mouse_pos: [0.0, 0.0],
+            mouse_buttons: [false; 5],
         };
 
         // Create D3D9 device
@@ -201,9 +206,10 @@ impl Overlay {
         unsafe {
             // Process Windows messages
             let mut msg: MSG = mem::zeroed();
-            if PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            while PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 TranslateMessage(&msg);
                 DispatchMessageA(&msg);
+
                 if msg.message == WM_QUIT {
                     return false;
                 }
@@ -218,10 +224,29 @@ impl Overlay {
                 self.reset_device();
             }
 
+            // Poll mouse position relative to window
+            let mut cursor_pos: POINT = mem::zeroed();
+            GetCursorPos(&mut cursor_pos);
+            ScreenToClient(self.hwnd, &mut cursor_pos);
+            self.mouse_pos = [cursor_pos.x as f32, cursor_pos.y as f32];
+
+            // Poll mouse button states using GetAsyncKeyState
+            // High bit indicates if key is down
+            self.mouse_buttons[0] = (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0;
+            self.mouse_buttons[1] = (GetAsyncKeyState(VK_RBUTTON) as u16 & 0x8000) != 0;
+            self.mouse_buttons[2] = (GetAsyncKeyState(VK_MBUTTON) as u16 & 0x8000) != 0;
+            self.mouse_buttons[3] = (GetAsyncKeyState(VK_XBUTTON1) as u16 & 0x8000) != 0;
+            self.mouse_buttons[4] = (GetAsyncKeyState(VK_XBUTTON2) as u16 & 0x8000) != 0;
+
+            // Update ImGui IO with mouse state
+            let io = self.imgui.io_mut();
+            io.mouse_pos = self.mouse_pos;
+            io.mouse_down = self.mouse_buttons;
+
             // Update delta time
             let now = Instant::now();
             let delta = now - self.last_frame;
-            self.imgui.io_mut().delta_time = delta.as_secs_f32();
+            io.delta_time = delta.as_secs_f32();
             self.last_frame = now;
         }
 
@@ -298,12 +323,25 @@ fn main() {
         // Render UI
         overlay.render(|ui| {
             Window::new("Overlay")
-                .size([300.0, 200.0], Condition::FirstUseEver)
+                .size([300.0, 250.0], Condition::FirstUseEver)
                 .build(ui, || {
                     ui.text("Hello from ImGui!");
                     if ui.button("Click me") {
                         println!("Button clicked!");
                     }
+
+                    ui.separator();
+                    ui.text("Mouse Debug:");
+                    ui.text(format!("Position: ({:.1}, {:.1})",
+                        ui.io().mouse_pos[0],
+                        ui.io().mouse_pos[1]));
+                    ui.text(format!("Left: {} | Right: {} | Middle: {}",
+                        ui.io().mouse_down[0],
+                        ui.io().mouse_down[1],
+                        ui.io().mouse_down[2]));
+                    ui.text(format!("Wheel: {:.2} | WheelH: {:.2}",
+                        ui.io().mouse_wheel,
+                        ui.io().mouse_wheel_h));
                 });
         });
     }
