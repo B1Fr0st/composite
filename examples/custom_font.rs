@@ -23,7 +23,7 @@ fn main() {
 
     // Example 2: Using configure_fonts for advanced configuration
     overlay.configure_fonts(|imgui| {
-        let fonts = imgui.fonts();
+        let mut fonts = imgui.fonts();
 
         // Add default font with larger size
         fonts.add_font(&[FontSource::DefaultFontData {

@@ -320,13 +320,15 @@ impl Overlay {
     /// ```
     pub fn add_fonts(&mut self, font_sources: &[FontSource]) -> bool {
         // Clear existing fonts and add new ones
-        let fonts = self.imgui.fonts();
+        
+        {
+            let mut fonts = self.imgui.fonts();
 
-        // Add the new fonts
-        for source in font_sources {
-            fonts.add_font(&[source.clone()]);
+            // Add the new fonts
+            for source in font_sources {
+                fonts.add_font(&[source.clone()]);
+            }
         }
-
         // Rebuild the renderer with the new font atlas
         self.rebuild_renderer()
     }
