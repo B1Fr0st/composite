@@ -12,6 +12,8 @@ use winapi::shared::windef::*;
 use winapi::shared::winerror::*;
 use winapi::um::winuser::*;
 
+pub use imgui;
+
 // D3D9 error codes
 const D3DERR_DEVICELOST: i32 = 0x88760868_u32 as i32;
 const D3DERR_DEVICENOTRESET: i32 = 0x88760869_u32 as i32;
