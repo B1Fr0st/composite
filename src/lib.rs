@@ -1,385 +1,171 @@
-use imgui::*;
-use imgui_dx9_renderer::Renderer;
-use std::mem;
-use std::ptr;
-use std::time::Instant;
-use wio::com::ComPtr;
-use winapi::shared::d3d9::*;
-use winapi::shared::d3d9caps::*;
-use winapi::shared::d3d9types::*;
-use winapi::shared::minwindef::*;
-use winapi::shared::windef::*;
-use winapi::shared::winerror::*;
-use winapi::um::winuser::*;
+use std::num::NonZeroIsize;
+use raw_window_handle::{
+    HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle, HandleError,
+};
+use winapi::{
+    shared::windef::{HWND, RECT},
+    um::winuser::{FindWindowA, GetClientRect},
+};
+use wry::WebViewBuilder;
 
-pub use imgui;
+pub use wry;
 
-// D3D9 error codes
-const D3DERR_DEVICELOST: i32 = 0x88760868_u32 as i32;
-const D3DERR_DEVICENOTRESET: i32 = 0x88760869_u32 as i32;
+/// Messages received from the webview via `window.ipc.postMessage(...)`.
+pub type IpcHandler = Box<dyn Fn(String) + Send + 'static>;
 
+/// Configuration for creating an [`Overlay`].
+pub struct OverlayConfig {
+    /// Whether the webview background should be transparent.
+    pub transparent: bool,
+    /// Optional handler called when JavaScript sends a message via `window.ipc.postMessage`.
+    pub ipc_handler: Option<IpcHandler>,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            transparent: true,
+            ipc_handler: None,
+        }
+    }
+}
+
+/// Thin wrapper that implements [`HasWindowHandle`] for a raw Win32 HWND,
+/// letting wry embed a WebView directly into the Discord window.
+struct HwndWrapper(HWND);
+
+impl HasWindowHandle for HwndWrapper {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let handle = Win32WindowHandle::new(
+            NonZeroIsize::new(self.0 as isize)
+                .expect("HWND must be non-null"),
+        );
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(handle)) })
+    }
+}
+
+/// A wry [`WebView`](wry::WebView) embedded directly inside the Discord Overlay window.
+///
+/// No intermediary window is created — the webview is a child of Discord's own HWND.
+///
+/// # Example
+/// ```no_run
+/// use newoverlay::{Overlay, OverlayConfig};
+///
+/// let mut overlay = Overlay::new(OverlayConfig::default()).unwrap();
+/// overlay.load_html(r#"<body style="background:transparent"><h1 style="color:red">Hello</h1></body>"#);
+/// overlay.run();
+/// ```
 pub struct Overlay {
-    hwnd: HWND,
-    d3d: Option<ComPtr<IDirect3D9>>,
-    device: Option<ComPtr<IDirect3DDevice9>>,
-    present_params: D3DPRESENT_PARAMETERS,
-    imgui: Context,
-    renderer: Option<Renderer>,
-    resize_width: u32,
-    resize_height: u32,
-    last_frame: Instant,
-    mouse_pos: [f32; 2],
-    mouse_buttons: [bool; 5],
+    webview: wry::WebView,
+    discord_hwnd: HWND,
 }
 
 impl Overlay {
-    pub fn new() -> Option<Self> {
-        // Find Discord Overlay window
-        let hwnd = unsafe {
+    /// Find the Discord Overlay window and embed a WebView into it directly.
+    pub fn new(config: OverlayConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let discord_hwnd = unsafe {
             FindWindowA(
                 b"Chrome_WidgetWin_1\0".as_ptr() as *const i8,
                 b"Discord Overlay\0".as_ptr() as *const i8,
             )
         };
 
-        if hwnd.is_null() {
-            eprintln!("Failed to find discord window");
-            return None;
+        if discord_hwnd.is_null() {
+            return Err("Failed to find Discord Overlay window (is Discord running?)".into());
         }
 
-        println!("Found discord window: {:?}", hwnd);
+        println!("Found Discord Overlay window: {:?}", discord_hwnd);
 
-        let mut imgui = Context::create();
-        imgui.set_ini_filename(None);
+        let mut builder = WebViewBuilder::new()
+            .with_transparent(config.transparent);
 
-        let mut overlay = Self {
-            hwnd,
-            d3d: None,
-            device: None,
-            present_params: unsafe { mem::zeroed() },
-            imgui,
-            renderer: None,
-            resize_width: 0,
-            resize_height: 0,
-            last_frame: Instant::now(),
-            mouse_pos: [0.0, 0.0],
-            mouse_buttons: [false; 5],
-        };
-
-        // Create D3D9 device
-        if !overlay.create_device() {
-            eprintln!("Failed to create D3D9 device");
-            return None;
+        if let Some(handler) = config.ipc_handler {
+            builder = builder.with_ipc_handler(move |msg| {
+                handler(msg.body().to_string());
+            });
         }
 
-        // Initialize ImGui
-        // Don't enable keyboard/gamepad navigation to avoid key mapping requirements
-        // overlay.imgui.io_mut().config_flags |= ConfigFlags::NAV_ENABLE_KEYBOARD;
-        // overlay.imgui.io_mut().config_flags |= ConfigFlags::NAV_ENABLE_GAMEPAD;
+        let webview = builder.build_as_child(&HwndWrapper(discord_hwnd))?;
 
-        // Set dark style
-        let style = overlay.imgui.style_mut();
-        style.use_dark_colors();
-
-        // Setup display size
-        let mut rect: RECT = unsafe { mem::zeroed() };
-        unsafe {
-            GetClientRect(hwnd, &mut rect);
-            overlay.imgui.io_mut().display_size = [
-                (rect.right - rect.left) as f32,
-                (rect.bottom - rect.top) as f32,
-            ];
-        }
-
-        // Initialize renderer
-        match unsafe { Renderer::new(&mut overlay.imgui, overlay.device.clone().unwrap()) } {
-            Ok(renderer) => {
-                overlay.renderer = Some(renderer);
-            }
-            Err(e) => {
-                eprintln!("Failed to create ImGui renderer: {}", e);
-                return None;
-            }
-        }
-
-        Some(overlay)
+        Ok(Self { webview, discord_hwnd })
     }
 
-    fn create_device(&mut self) -> bool {
-        unsafe {
-            // Create D3D9
-            let d3d = Direct3DCreate9(D3D_SDK_VERSION);
-            if d3d.is_null() {
-                eprintln!("Failed to create D3D9");
-                return false;
-            }
-            self.d3d = Some(ComPtr::from_raw(d3d));
+    /// Load a URL into the webview.
+    pub fn load_url(&self, url: &str) {
+        let _ = self.webview.load_url(url);
+    }
 
-            // Get client rect for back buffer size
-            let mut rect: RECT = mem::zeroed();
-            GetClientRect(self.hwnd, &mut rect);
-            let width = (rect.right - rect.left) as u32;
-            let height = (rect.bottom - rect.top) as u32;
+    /// Load a raw HTML string into the webview.
+    pub fn load_html(&self, html: &str) {
+        let _ = self.webview.load_html(html);
+    }
 
-            // Setup present parameters
-            self.present_params.BackBufferWidth = width;
-            self.present_params.BackBufferHeight = height;
-            self.present_params.BackBufferFormat = D3DFMT_A8R8G8B8;
-            self.present_params.BackBufferCount = 1;
-            self.present_params.MultiSampleType = D3DMULTISAMPLE_NONE;
-            self.present_params.MultiSampleQuality = 0;
-            self.present_params.SwapEffect = D3DSWAPEFFECT_DISCARD;
-            self.present_params.hDeviceWindow = self.hwnd;
-            self.present_params.Windowed = TRUE;
-            self.present_params.EnableAutoDepthStencil = TRUE;
-            self.present_params.AutoDepthStencilFormat = D3DFMT_D16;
-            self.present_params.Flags = 0;
-            self.present_params.FullScreen_RefreshRateInHz = 0;
-            self.present_params.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    /// Evaluate a JavaScript expression in the webview.
+    pub fn eval(&self, js: &str) {
+        let _ = self.webview.evaluate_script(js);
+    }
 
-            // Create device
-            let mut device: *mut IDirect3DDevice9 = ptr::null_mut();
-            let d3d_ref = self.d3d.as_ref().unwrap();
-            let hr = d3d_ref.CreateDevice(
-                D3DADAPTER_DEFAULT,
-                D3DDEVTYPE_HAL,
-                self.hwnd as _,
-                D3DCREATE_HARDWARE_VERTEXPROCESSING,
-                &mut self.present_params,
-                &mut device,
-            );
+    /// Resize the embedded webview to match the current Discord client rect.
+    ///
+    /// Call this whenever you detect Discord has been resized.
+    pub fn sync_size(&self) {
+        if let Some((w, h)) = self.discord_client_size() {
+            let _ = self.webview.set_bounds(wry::Rect {
+                position: wry::dpi::LogicalPosition::new(0.0, 0.0).into(),
+                size: wry::dpi::LogicalSize::new(w as f64, h as f64).into(),
+            });
+        }
+    }
 
-            if FAILED(hr) {
-                eprintln!("Failed to create D3D9 device with hardware VP: 0x{:08X}", hr);
-                eprintln!("Trying software vertex processing...");
+    /// Return a reference to the underlying [`wry::WebView`].
+    pub fn webview(&self) -> &wry::WebView {
+        &self.webview
+    }
 
-                // Try software vertex processing
-                let hr = d3d_ref.CreateDevice(
-                    D3DADAPTER_DEFAULT,
-                    D3DDEVTYPE_HAL,
-                    self.hwnd as _,
-                    D3DCREATE_SOFTWARE_VERTEXPROCESSING,
-                    &mut self.present_params,
-                    &mut device,
-                );
+    /// Run a simple message-pump loop, keeping the webview sized to Discord and
+    /// exiting when Discord's window disappears.
+    pub fn run(self) {
+        self.sync_size();
 
-                if FAILED(hr) {
-                    eprintln!("Failed to create D3D9 device with software VP: 0x{:08X}", hr);
-                    return false;
+        loop {
+            // Pump Windows messages so the embedded WebView2 can process events.
+            unsafe {
+                use winapi::um::winuser::{PeekMessageA, TranslateMessage, DispatchMessageA, PM_REMOVE};
+                use winapi::um::winuser::MSG;
+                use std::mem;
+                use std::ptr;
+
+                let mut msg: MSG = mem::zeroed();
+                while PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageA(&msg);
+
+                    if msg.message == winapi::um::winuser::WM_QUIT {
+                        return;
+                    }
                 }
             }
 
-            if device.is_null() {
-                eprintln!("Device pointer is null despite success HRESULT");
-                return false;
-            }
-
-            self.device = Some(ComPtr::from_raw(device));
-            true
-        }
-    }
-
-    fn reset_device(&mut self) {
-        // Drop and recreate renderer on device reset
-        self.renderer = None;
-
-        unsafe {
-            let device_ref = self.device.as_ref().unwrap();
-            let hr = device_ref.Reset(&mut self.present_params);
-            if FAILED(hr) {
-                eprintln!("Device reset failed: 0x{:08X}", hr);
+            // Keep webview bounds in sync with Discord
+            if self.discord_client_size().is_none() {
+                eprintln!("Discord Overlay window lost, shutting down.");
                 return;
             }
-        }
 
-        // Recreate renderer
-        match unsafe { Renderer::new(&mut self.imgui, self.device.clone().unwrap()) } {
-            Ok(renderer) => {
-                self.renderer = Some(renderer);
-            }
-            Err(e) => {
-                eprintln!("Failed to recreate ImGui renderer: {}", e);
-            }
+            self.sync_size();
         }
     }
 
-    pub fn start_render(&mut self) -> bool {
+    fn discord_client_size(&self) -> Option<(u32, u32)> {
         unsafe {
-            // Process Windows messages
-            let mut msg: MSG = mem::zeroed();
-            while PeekMessageA(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageA(&msg);
-
-                if msg.message == WM_QUIT {
-                    return false;
-                }
+            let mut rect: RECT = std::mem::zeroed();
+            if GetClientRect(self.discord_hwnd, &mut rect) == 0 {
+                return None;
             }
-
-            // Handle resize
-            if self.resize_width != 0 && self.resize_height != 0 {
-                self.present_params.BackBufferWidth = self.resize_width;
-                self.present_params.BackBufferHeight = self.resize_height;
-                self.resize_width = 0;
-                self.resize_height = 0;
-                self.reset_device();
-            }
-
-            // Poll mouse position relative to window
-            let mut cursor_pos: POINT = mem::zeroed();
-            GetCursorPos(&mut cursor_pos);
-            ScreenToClient(self.hwnd, &mut cursor_pos);
-            self.mouse_pos = [cursor_pos.x as f32, cursor_pos.y as f32];
-
-            // High bit indicates if key is down
-            self.mouse_buttons[0] = (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0;
-            self.mouse_buttons[1] = (GetAsyncKeyState(VK_RBUTTON) as u16 & 0x8000) != 0;
-            self.mouse_buttons[2] = (GetAsyncKeyState(VK_MBUTTON) as u16 & 0x8000) != 0;
-            self.mouse_buttons[3] = (GetAsyncKeyState(VK_XBUTTON1) as u16 & 0x8000) != 0;
-            self.mouse_buttons[4] = (GetAsyncKeyState(VK_XBUTTON2) as u16 & 0x8000) != 0;
-
-            // Update ImGui IO with mouse state
-            let io = self.imgui.io_mut();
-            io.mouse_pos = self.mouse_pos;
-            io.mouse_down = self.mouse_buttons;
-
-            // Update delta time
-            let now = Instant::now();
-            let delta = now - self.last_frame;
-            io.delta_time = delta.as_secs_f32();
-            self.last_frame = now;
+            let w = (rect.right - rect.left) as u32;
+            let h = (rect.bottom - rect.top) as u32;
+            if w == 0 || h == 0 { None } else { Some((w, h)) }
         }
-
-        true
-    }
-
-    pub fn render<F>(&mut self, f: F)
-    where
-        F: FnOnce(&Ui),
-    {
-        let ui = self.imgui.frame();
-        f(&ui);
-
-        // ui is dropped here and draw data is generated
-        let draw_data = ui.render();
-
-        unsafe {
-            let device_ref = self.device.as_ref().unwrap();
-
-            device_ref.SetRenderState(D3DRS_ZENABLE, FALSE as u32);
-            device_ref.SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE as u32);
-            device_ref.SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE as u32);
-
-            device_ref.Clear(
-                0,
-                ptr::null_mut(),
-                D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-                0x00000000, // Transparent black
-                1.0,
-                0,
-            );
-
-            if SUCCEEDED(device_ref.BeginScene()) {
-                if let Some(renderer) = &mut self.renderer {
-                    let _ = renderer.render(draw_data);
-                }
-                device_ref.EndScene();
-            }
-
-            let hr = device_ref.Present(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
-
-            // Handle device loss
-            if hr == D3DERR_DEVICELOST as i32 {
-                if device_ref.TestCooperativeLevel() == D3DERR_DEVICENOTRESET as i32 {
-                    self.reset_device();
-                }
-            }
-        }
-    }
-
-    pub fn handle_resize(&mut self, width: u32, height: u32) {
-        self.resize_width = width;
-        self.resize_height = height;
-    }
-
-    /// Add a custom font to the ImGui context
-    ///
-    /// # Arguments
-    /// * `font_sources` - Array of FontSource configurations to add
-    ///
-    /// # Example
-    /// ```no_run
-    /// use imgui::FontSource;
-    ///
-    /// let font_data = include_bytes!("../path/to/font.ttf");
-    /// overlay.add_fonts(&[
-    ///     FontSource::TtfData {
-    ///         data: font_data,
-    ///         size_pixels: 18.0,
-    ///         config: None,
-    ///     }
-    /// ]);
-    /// ```
-    pub fn add_fonts(&mut self, font_sources: &[FontSource]) -> bool {
-        // Clear existing fonts and add new ones
-        
-        {
-            let mut fonts = self.imgui.fonts();
-
-            // Add the new fonts
-            for source in font_sources {
-                fonts.add_font(&[source.clone()]);
-            }
-        }
-        // Rebuild the renderer with the new font atlas
-        self.rebuild_renderer()
-    }
-
-    /// Rebuild the ImGui renderer (useful after font changes)
-    fn rebuild_renderer(&mut self) -> bool {
-        // Drop existing renderer
-        self.renderer = None;
-
-        // Recreate renderer with updated font atlas
-        match unsafe { Renderer::new(&mut self.imgui, self.device.clone().unwrap()) } {
-            Ok(renderer) => {
-                self.renderer = Some(renderer);
-                true
-            }
-            Err(e) => {
-                eprintln!("Failed to rebuild ImGui renderer: {}", e);
-                false
-            }
-        }
-    }
-
-    /// Get mutable access to the ImGui context for advanced font configuration
-    ///
-    /// # Example
-    /// ```no_run
-    /// use imgui::{FontSource, FontConfig, FontGlyphRanges};
-    ///
-    /// overlay.configure_fonts(|imgui| {
-    ///     let font_data = include_bytes!("../font.ttf");
-    ///     let mut config = FontConfig::default();
-    ///     config.oversample_h = 2;
-    ///     config.oversample_v = 2;
-    ///
-    ///     imgui.fonts().add_font(&[FontSource::TtfData {
-    ///         data: font_data,
-    ///         size_pixels: 16.0,
-    ///         config: Some(config),
-    ///     }]);
-    /// });
-    /// ```
-    pub fn configure_fonts<F>(&mut self, f: F) -> bool
-    where
-        F: FnOnce(&mut Context),
-    {
-        // Allow user to configure fonts
-        f(&mut self.imgui);
-
-        // Rebuild renderer with new font atlas
-        self.rebuild_renderer()
     }
 }

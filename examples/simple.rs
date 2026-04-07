@@ -1,97 +1,77 @@
-use imgui::*;
-use newoverlay::Overlay;
+use newoverlay::{Overlay, OverlayConfig};
 
 fn main() {
-    let mut overlay = match Overlay::new() {
-        Some(o) => o,
-        None => {
-            eprintln!("Failed to initialize overlay");
-            return;
-        }
+    let overlay = match Overlay::new(OverlayConfig {
+        ipc_handler: Some(Box::new(|msg| println!("[ipc] {}", msg))),
+        ..OverlayConfig::default()
+    }) {
+        Ok(o) => o,
+        Err(e) => { eprintln!("Failed to initialize overlay: {}", e); return; }
     };
 
-    println!("Overlay initialized successfully!");
+    overlay.load_html(r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  canvas { position: absolute; top: 0; left: 0; }
+  #ui { position: absolute; top: 20px; left: 20px; color: white; font-family: sans-serif;
+        background: rgba(0,0,0,0.5); padding: 12px 16px; border-radius: 8px; }
+  button { margin-top: 8px; padding: 4px 10px; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div>Overlay running!</div>
+  <div id="mouse">Mouse: (0, 0)</div>
+  <button onclick="window.ipc.postMessage('button_clicked')">Click me</button>
+</div>
+<script>
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
 
-    // Main render loop
-    loop {
-        if !overlay.start_render() {
-            break;
-        }
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    draw();
+  }
 
-        // Render UI
-        overlay.render(|ui| {
-            // Get background draw list (draws behind windows)
-            let draw_list = ui.get_background_draw_list();
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            // Draw a line
-            draw_list
-                .add_line([100.0, 100.0], [300.0, 100.0], [1.0, 0.0, 0.0, 1.0])
-                .thickness(2.0)
-                .build();
+    // Red line
+    ctx.strokeStyle = 'red'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(100, 100); ctx.lineTo(300, 100); ctx.stroke();
 
-            // Draw a rectangle (filled)
-            draw_list.add_rect(
-                [100.0, 120.0],
-                [300.0, 220.0],
-                [0.0, 1.0, 0.0, 0.5] // Green with 50% alpha
-            )
-            .filled(true)
-            .build();
+    // Green filled rect
+    ctx.fillStyle = 'rgba(0,255,0,0.5)';
+    ctx.fillRect(100, 120, 200, 100);
+    ctx.strokeStyle = 'rgba(0,255,0,1)'; ctx.lineWidth = 2;
+    ctx.strokeRect(100, 120, 200, 100);
 
-            // Draw a rectangle (outline)
-            draw_list.add_rect(
-                [100.0, 120.0],
-                [300.0, 220.0],
-                [0.0, 1.0, 0.0, 1.0]
-            )
-            .thickness(2.0)
-            .build();
+    // Yellow circle
+    ctx.beginPath(); ctx.arc(450, 170, 50, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,0,0.5)'; ctx.fill();
+    ctx.strokeStyle = 'yellow'; ctx.lineWidth = 2; ctx.stroke();
 
-            // Draw a circle (filled)
-            draw_list.add_circle(
-                [450.0, 170.0],
-                50.0,
-                [1.0, 1.0, 0.0, 0.5] // Yellow with 50% alpha
-            )
-            .filled(true)
-            .build();
+    // Text
+    ctx.fillStyle = 'white'; ctx.font = '16px sans-serif';
+    ctx.fillText('Direct canvas rendering!', 100, 240);
+  }
 
-            // Draw a circle (outline)
-            draw_list.add_circle(
-                [450.0, 170.0],
-                50.0,
-                [1.0, 1.0, 0.0, 1.0]
-            )
-            .thickness(2.0)
-            .build();
+  window.addEventListener('resize', resize);
+  window.addEventListener('mousemove', (e) => {
+    document.getElementById('mouse').textContent = `Mouse: (${e.clientX}, ${e.clientY})`;
+  });
+  resize();
+</script>
+</body>
+</html>"#);
 
-            // Draw text without a window
-            draw_list.add_text([100.0, 240.0], [1.0, 1.0, 1.0, 1.0], "Direct text rendering!");
-
-            // Optional: Show debug window
-            Window::new("Overlay")
-                .size([300.0, 250.0], Condition::FirstUseEver)
-                .build(ui, || {
-                    ui.text("Hello from ImGui!");
-                    if ui.button("Click me") {
-                        println!("Button clicked!");
-                    }
-
-                    ui.separator();
-                    ui.text("Mouse Debug:");
-                    ui.text(format!("Position: ({:.1}, {:.1})",
-                        ui.io().mouse_pos[0],
-                        ui.io().mouse_pos[1]));
-                    ui.text(format!("Left: {} | Right: {} | Middle: {}",
-                        ui.io().mouse_down[0],
-                        ui.io().mouse_down[1],
-                        ui.io().mouse_down[2]));
-                    ui.text(format!("Wheel: {:.2} | WheelH: {:.2}",
-                        ui.io().mouse_wheel,
-                        ui.io().mouse_wheel_h));
-                });
-        });
-    }
-
-    println!("Overlay shutting down");
+    println!("Overlay initialized.");
+    overlay.run();
+    println!("Overlay shutting down.");
 }
