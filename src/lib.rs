@@ -301,47 +301,94 @@ impl Overlay {
                 .filter(|(_, &down)| down)
                 .fold(0u8, |acc, (i, _)| acc | (1 << BUTTONS_BIT[i]));
 
-            if (mx, my) != last_mouse {
-                last_mouse = (mx, my);
-                let js = format!(
-                    "(function(){{\
-                       var t=document.elementFromPoint({mx},{my})||document.body;\
-                       t.dispatchEvent(new MouseEvent('mousemove',\
-                         {{clientX:{mx},clientY:{my},buttons:{buttons_mask},\
-                           bubbles:true,cancelable:true}}));\
-                     }})();"
-                );
-                let _ = self.webview.evaluate_script(&js);
-            }
-
             const BUTTON_NUM: [u16; 5] = [0, 2, 1, 3, 4];
-            for i in 0..5 {
-                if buttons[i] != last_buttons[i] {
-                    let evt = if buttons[i] { "mousedown" } else { "mouseup" };
-                    let btn = BUTTON_NUM[i];
-                    let js = format!(
-                        "(function(){{\
-                           var t=document.elementFromPoint({mx},{my})||document.body;\
-                           t.dispatchEvent(new MouseEvent('{evt}',\
-                             {{clientX:{mx},clientY:{my},button:{btn},\
-                               buttons:{buttons_mask},bubbles:true,cancelable:true}}));\
-                         }})();"
-                    );
-                    let _ = self.webview.evaluate_script(&js);
 
-                    if i == 0 && !buttons[i] {
-                        let js = format!(
+            let mut js = format!("window.__lastButtonsMask={buttons_mask};");
+
+            for i in 0..5usize {
+                if buttons[i] != last_buttons[i] {
+                    let btn = BUTTON_NUM[i];
+                    if buttons[i] {
+                        // mousedown: capture element under cursor.
+                        // If it's an input[type=range], also record the slider's rect
+                        // so we can compute values from cursor position during drag.
+                        js.push_str(&format!(
                             "(function(){{\
                                var t=document.elementFromPoint({mx},{my})||document.body;\
-                               t.dispatchEvent(new MouseEvent('click',\
-                                 {{clientX:{mx},clientY:{my},button:0,\
+                               window.__capturedEl=t;\
+                               if(t.tagName==='INPUT'&&t.type==='range'){{\
+                                 var r=t.getBoundingClientRect();\
+                                 window.__sliderDrag={{el:t,rect:r}};\
+                               }}\
+                               t.dispatchEvent(new MouseEvent('mousedown',\
+                                 {{clientX:{mx},clientY:{my},button:{btn},\
                                    buttons:{buttons_mask},bubbles:true,cancelable:true}}));\
                              }})();"
-                        );
-                        let _ = self.webview.evaluate_script(&js);
+                        ));
+                    } else {
+                        // mouseup: clear slider drag state, dispatch events
+                        js.push_str(&format!(
+                            "(function(){{\
+                               window.__sliderDrag=null;\
+                               var t=window.__capturedEl||document.elementFromPoint({mx},{my})||document.body;\
+                               window.__capturedEl=null;\
+                               t.dispatchEvent(new MouseEvent('mouseup',\
+                                 {{clientX:{mx},clientY:{my},button:{btn},\
+                                   buttons:{buttons_mask},bubbles:true,cancelable:true}}));\
+                             }})();"
+                        ));
+                        if i == 0 {
+                            js.push_str(&format!(
+                                "(function(){{\
+                                   var t=document.elementFromPoint({mx},{my})||document.body;\
+                                   t.dispatchEvent(new MouseEvent('click',\
+                                     {{clientX:{mx},clientY:{my},button:0,\
+                                       buttons:{buttons_mask},bubbles:true,cancelable:true}}));\
+                                 }})();"
+                            ));
+                        }
                     }
                 }
             }
+
+            // mousemove: if dragging a range input, compute and set its value directly —
+            // synthetic events cannot move the slider thumb in WebView2's renderer.
+            // For all other elements, dispatch mousemove to the captured/hovered element.
+            if (mx, my) != last_mouse || !js.is_empty() {
+                last_mouse = (mx, my);
+                js.push_str(&format!(
+                    "(function(){{\
+                       var sd=window.__sliderDrag;\
+                       if(sd&&{buttons_mask}){{\
+                         var r=sd.rect;\
+                         var pct=Math.max(0,Math.min(1,({mx}-r.left)/(r.width||1)));\
+                         var mn=parseFloat(sd.el.min)||0;\
+                         var mx2=parseFloat(sd.el.max)||100;\
+                         var step=parseFloat(sd.el.step)||1;\
+                         var raw=mn+pct*(mx2-mn);\
+                         var val=Math.round(raw/step)*step;\
+                         val=Math.max(mn,Math.min(mx2,val));\
+                         if(sd.el.value!=val){{\
+                           sd.el.value=val;\
+                           sd.el.dispatchEvent(new Event('input',{{bubbles:true}}));\
+                           sd.el.dispatchEvent(new Event('change',{{bubbles:true}}));\
+                         }}\
+                       }}else{{\
+                         var t=(window.__capturedEl&&{buttons_mask})\
+                               ?window.__capturedEl\
+                               :(document.elementFromPoint({mx},{my})||document.body);\
+                         t.dispatchEvent(new MouseEvent('mousemove',\
+                           {{clientX:{mx},clientY:{my},buttons:{buttons_mask},\
+                             bubbles:true,cancelable:true}}));\
+                       }}\
+                     }})();"
+                ));
+            }
+
+            if !js.is_empty() {
+                let _ = self.webview.evaluate_script(&js);
+            }
+
             last_buttons = buttons;
 
             // --- per-frame callback (IPC drain, etc.) ---
