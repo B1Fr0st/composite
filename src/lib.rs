@@ -220,6 +220,7 @@ impl Overlay {
             if self.resize_width != 0 && self.resize_height != 0 {
                 self.present_params.BackBufferWidth = self.resize_width;
                 self.present_params.BackBufferHeight = self.resize_height;
+                self.imgui.io_mut().display_size = [self.resize_width as f32, self.resize_height as f32];
                 self.resize_width = 0;
                 self.resize_height = 0;
                 self.reset_device();
@@ -300,6 +301,11 @@ impl Overlay {
     pub fn handle_resize(&mut self, width: u32, height: u32) {
         self.resize_width = width;
         self.resize_height = height;
+    }
+
+    pub fn window_size(&self) -> (u32, u32) {
+        let [w, h] = self.imgui.io().display_size;
+        (w as u32, h as u32)
     }
 
     /// Add a custom font to the ImGui context
