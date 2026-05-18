@@ -179,26 +179,57 @@ impl Overlay {
         }
     }
 
-    fn reset_device(&mut self) {
-        // Drop and recreate renderer on device reset
+    fn reset_device(&mut self) -> bool {
+        // Drop the renderer before Reset — DX9 requires all default-pool
+        // resources released before the device can be reset.
         self.renderer = None;
 
+        let device = match self.device.as_ref() {
+            Some(d) => d.clone(),
+            None => return false,
+        };
+
         unsafe {
-            let device_ref = self.device.as_ref().unwrap();
-            let hr = device_ref.Reset(&mut self.present_params);
+            let hr = device.Reset(&mut self.present_params);
             if FAILED(hr) {
                 eprintln!("Device reset failed: 0x{:08X}", hr);
-                return;
+                // Leave self.device as-is so the next frame can poll
+                // TestCooperativeLevel and retry. Don't drop it; recreating
+                // the IDirect3D9 entry point mid-loop is heavier than waiting.
+                return false;
             }
         }
 
-        // Recreate renderer
-        match unsafe { Renderer::new(&mut self.imgui, self.device.clone().unwrap()) } {
+        match unsafe { Renderer::new(&mut self.imgui, device) } {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
+                true
             }
             Err(e) => {
                 eprintln!("Failed to recreate ImGui renderer: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Returns true when the device is ready to issue draw calls this frame.
+    /// Handles cooperative-level transitions (lost / not-reset) so the
+    /// renderer never runs against a stale device.
+    fn ensure_device_ready(&mut self) -> bool {
+        let coop = unsafe {
+            match self.device.as_ref() {
+                Some(device) => device.TestCooperativeLevel(),
+                None => return false,
+            }
+        };
+
+        match coop {
+            0 /* D3D_OK */ => self.renderer.is_some(),
+            hr if hr == D3DERR_DEVICENOTRESET => self.reset_device(),
+            hr if hr == D3DERR_DEVICELOST => false,
+            other => {
+                eprintln!("Unexpected cooperative level: 0x{:08X}", other);
+                false
             }
         }
     }
@@ -258,20 +289,33 @@ impl Overlay {
     where
         F: FnOnce(&Ui),
     {
+        // Recover the device before the imgui frame begins. Doing it after
+        // imgui.frame() would conflict with the Ui<'_> borrow on self.imgui,
+        // and resetting mid-frame would invalidate the draw data anyway.
+        if !self.ensure_device_ready() {
+            // Still run the UI closure so the caller's per-frame state stays
+            // consistent across skipped frames; just discard the draw data.
+            let ui = self.imgui.frame();
+            f(&ui);
+            let _ = ui.render();
+            return;
+        }
+
+        let device = match self.device.as_ref() {
+            Some(d) => d.clone(),
+            None => return,
+        };
+
         let ui = self.imgui.frame();
         f(&ui);
-
-        // ui is dropped here and draw data is generated
         let draw_data = ui.render();
 
         unsafe {
-            let device_ref = self.device.as_ref().unwrap();
+            device.SetRenderState(D3DRS_ZENABLE, FALSE as u32);
+            device.SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE as u32);
+            device.SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE as u32);
 
-            device_ref.SetRenderState(D3DRS_ZENABLE, FALSE as u32);
-            device_ref.SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE as u32);
-            device_ref.SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE as u32);
-
-            device_ref.Clear(
+            let hr = device.Clear(
                 0,
                 ptr::null_mut(),
                 D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
@@ -279,21 +323,32 @@ impl Overlay {
                 1.0,
                 0,
             );
-
-            if SUCCEEDED(device_ref.BeginScene()) {
-                if let Some(renderer) = &mut self.renderer {
-                    let _ = renderer.render(draw_data);
-                }
-                device_ref.EndScene();
+            if FAILED(hr) {
+                // Device was lost between TestCooperativeLevel and Clear.
+                // Bail before issuing any draw calls — next frame will recover.
+                return;
             }
 
-            let hr = device_ref.Present(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            let begin_hr = device.BeginScene();
+            if FAILED(begin_hr) {
+                return;
+            }
 
-            // Handle device loss
-            if hr == D3DERR_DEVICELOST as i32 {
-                if device_ref.TestCooperativeLevel() == D3DERR_DEVICENOTRESET as i32 {
-                    self.reset_device();
-                }
+            if let Some(renderer) = &mut self.renderer {
+                let _ = renderer.render(draw_data);
+            }
+            device.EndScene();
+
+            let present_hr =
+                device.Present(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+
+            // Present can return DEVICELOST or DEVICENOTRESET directly; both
+            // are recoverable. Defer the actual reset to the next frame's
+            // ensure_device_ready() so we don't reset mid-render.
+            if present_hr == D3DERR_DEVICELOST as i32
+                || present_hr == D3DERR_DEVICENOTRESET as i32
+            {
+                self.renderer = None;
             }
         }
     }
