@@ -1,4 +1,4 @@
-use newoverlay::{Overlay, OverlayConfig};
+use composite::{Overlay, OverlayConfig};
 
 fn main() {
     // Use new_with_ipc_queue so the IPC closure in run_with_ipc_mut can

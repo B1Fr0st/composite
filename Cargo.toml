@@ -1,11 +1,11 @@
 [package]
-name = "newoverlay"
+name = "composite"
 version = "0.2.0"
 edition = "2024"
 description = "Ready-to-use Discord overlay rendering with Wry, ImGui, and D3D11 textures"
 
 [lib]
-name = "newoverlay"
+name = "composite"
 path = "src/lib.rs"
 
 [dependencies]

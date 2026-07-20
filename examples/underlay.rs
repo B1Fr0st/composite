@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use newoverlay::{Overlay, OverlayConfig, imgui};
+use composite::{Overlay, OverlayConfig, imgui};
 
 fn main() {
     let mut overlay = match Overlay::new(OverlayConfig {

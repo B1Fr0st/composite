@@ -162,6 +162,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "composite"
+version = "0.2.0"
+dependencies = [
+ "imgui",
+ "imgui-dx11-renderer",
+ "raw-window-handle",
+ "serde_json",
+ "thiserror 2.0.18",
+ "winapi",
+ "windows 0.36.1",
+ "windows 0.61.3",
+ "wio",
+ "wry",
+]
+
+[[package]]
 name = "cookie"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1058,22 +1074,6 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
-
-[[package]]
-name = "newoverlay"
-version = "0.2.0"
-dependencies = [
- "imgui",
- "imgui-dx11-renderer",
- "raw-window-handle",
- "serde_json",
- "thiserror 2.0.18",
- "winapi",
- "windows 0.36.1",
- "windows 0.61.3",
- "wio",
- "wry",
-]
 
 [[package]]
 name = "num-conv"

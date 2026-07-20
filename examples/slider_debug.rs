@@ -1,4 +1,4 @@
-use newoverlay::{Overlay, OverlayConfig};
+use composite::{Overlay, OverlayConfig};
 
 fn main() {
     let overlay = match Overlay::new(OverlayConfig {
