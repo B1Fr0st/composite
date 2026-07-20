@@ -6,7 +6,10 @@ fn main() {
         ..OverlayConfig::default()
     }) {
         Ok(o) => o,
-        Err(e) => { eprintln!("Failed: {}", e); return; }
+        Err(e) => {
+            eprintln!("Failed: {}", e);
+            return;
+        }
     };
 
     overlay.load_html(r#"<!DOCTYPE html>

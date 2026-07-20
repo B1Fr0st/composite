@@ -6,9 +6,13 @@ fn main() {
     let overlay = match Overlay::new_with_ipc_queue(OverlayConfig {
         transparent: false,
         ipc_handler: None,
+        ..OverlayConfig::default()
     }) {
         Ok(o) => o,
-        Err(e) => { eprintln!("Failed to initialize overlay: {}", e); return; }
+        Err(e) => {
+            eprintln!("Failed to initialize overlay: {}", e);
+            return;
+        }
     };
 
     // Start at 720×480 in the top-left of Discord's client area.
@@ -128,17 +132,17 @@ fn main() {
     println!("YouTube overlay — drag title bar to move, grip to resize.");
 
     overlay.run_with_ipc_mut(|msg, webview, bounds| {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg) else { return; };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg) else {
+            return;
+        };
 
         match val["type"].as_str() {
             Some("move") => {
                 let dx = val["dx"].as_i64().unwrap_or(0) as i32;
                 let dy = val["dy"].as_i64().unwrap_or(0) as i32;
                 let pos: wry::dpi::PhysicalPosition<i32> = bounds.position.to_physical(1.0);
-                let new_pos = wry::dpi::PhysicalPosition::new(
-                    (pos.x + dx).max(0),
-                    (pos.y + dy).max(0),
-                );
+                let new_pos =
+                    wry::dpi::PhysicalPosition::new((pos.x + dx).max(0), (pos.y + dy).max(0));
                 bounds.position = new_pos.into();
                 let _ = webview.set_bounds(*bounds);
             }
@@ -147,7 +151,7 @@ fn main() {
                 let dy = val["dy"].as_i64().unwrap_or(0) as i32;
                 let sz: wry::dpi::PhysicalSize<u32> = bounds.size.to_physical(1.0);
                 let new_sz = wry::dpi::PhysicalSize::new(
-                    ((sz.width  as i32 + dx).max(320)) as u32,
+                    ((sz.width as i32 + dx).max(320)) as u32,
                     ((sz.height as i32 + dy).max(220)) as u32,
                 );
                 bounds.size = new_sz.into();
@@ -157,7 +161,11 @@ fn main() {
                 let pos: wry::dpi::PhysicalPosition<i32> = bounds.position.to_physical(1.0);
                 let _ = webview.set_bounds(wry::Rect {
                     position: pos.into(),
-                    size: wry::dpi::PhysicalSize::new(bounds.size.to_physical::<u32>(1.0).width, 28u32).into(),
+                    size: wry::dpi::PhysicalSize::new(
+                        bounds.size.to_physical::<u32>(1.0).width,
+                        28u32,
+                    )
+                    .into(),
                 });
             }
             Some("restore") | Some("reset") => {

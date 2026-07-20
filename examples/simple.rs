@@ -6,7 +6,10 @@ fn main() {
         ..OverlayConfig::default()
     }) {
         Ok(o) => o,
-        Err(e) => { eprintln!("Failed to initialize overlay: {}", e); return; }
+        Err(e) => {
+            eprintln!("Failed to initialize overlay: {}", e);
+            return;
+        }
     };
 
     overlay.load_html(r#"<!DOCTYPE html>

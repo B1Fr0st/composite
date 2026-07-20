@@ -9,11 +9,15 @@ fn main() {
         ..OverlayConfig::default()
     }) {
         Ok(o) => o,
-        Err(e) => { eprintln!("Failed to initialize overlay: {}", e); return; }
+        Err(e) => {
+            eprintln!("Failed to initialize overlay: {}", e);
+            return;
+        }
     };
 
     // Replace the src value with a base64-encoded data URI to embed a custom TTF/OTF.
-    overlay.load_html(r#"<!DOCTYPE html>
+    overlay.load_html(
+        r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -43,7 +47,8 @@ fn main() {
   <button onclick="window.ipc.postMessage('reset_font')">Reset font</button>
 </div>
 </body>
-</html>"#);
+</html>"#,
+    );
 
     // Demonstrate eval: change the title after 3 seconds from a background thread.
     let webview_ref = overlay.webview() as *const _ as usize;
@@ -52,9 +57,8 @@ fn main() {
         // NOTE: eval from another thread is safe via the webview's internal queue.
         // Cast back — the webview lives for the duration of the program.
         let wv = unsafe { &*(webview_ref as *const wry::WebView) };
-        let _ = wv.evaluate_script(
-            "document.getElementById('title').textContent = 'Injected after 3s!'"
-        );
+        let _ = wv
+            .evaluate_script("document.getElementById('title').textContent = 'Injected after 3s!'");
     });
 
     println!("Overlay initialized.");
