@@ -13,6 +13,7 @@ compile_error!("newoverlay currently supports Windows only");
 pub mod webview_texture;
 
 use std::{
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -82,6 +83,13 @@ pub struct OverlayConfig {
     pub clear_color: [f32; 4],
     /// Optional WebView IPC callback.
     pub ipc_handler: Option<IpcHandler>,
+    /// Custom user-data directory for the WebView2 environment.
+    /// When `None`, WebView2 uses its default location next to the executable.
+    pub data_directory: Option<PathBuf>,
+    /// Run the WebView in incognito / in-private mode.
+    pub incognito: bool,
+    /// Extra Chromium command-line flags passed to the WebView2 environment.
+    pub additional_browser_args: Option<String>,
 }
 
 impl Default for OverlayConfig {
@@ -93,6 +101,9 @@ impl Default for OverlayConfig {
             respect_imgui_mouse_capture: true,
             clear_color: [0.0, 0.0, 0.0, 0.0],
             ipc_handler: None,
+            data_directory: None,
+            incognito: false,
+            additional_browser_args: None,
         }
     }
 }
@@ -172,9 +183,15 @@ impl Overlay {
         let (width, height) = client_size(hwnd).ok_or(OverlayError::InvalidWindowSize)?;
         let d3d = D3d11State::new()?;
 
-        let mut builder = wry::WebViewBuilder::new()
+        let mut web_context = wry::WebContext::new(config.data_directory);
+        let mut builder = wry::WebViewBuilder::new_with_web_context(&mut web_context)
             .with_transparent(config.transparent)
-            .with_devtools(config.devtools);
+            .with_devtools(config.devtools)
+            .with_incognito(config.incognito);
+        use wry::WebViewBuilderExtWindows;
+        if let Some(args) = config.additional_browser_args {
+            builder = builder.with_additional_browser_args(args);
+        }
         if let Some(handler) = config.ipc_handler {
             builder = builder.with_ipc_handler(move |request| {
                 handler(request.body().to_string());
