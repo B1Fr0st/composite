@@ -137,8 +137,8 @@ impl Renderer {
     unsafe fn render_impl(&self, draw_data: &DrawData) -> Result<()> {
         let clip_off = draw_data.display_pos;
         let clip_scale = draw_data.framebuffer_scale;
-        let mut vertex_offset = 0;
-        let mut index_offset = 0;
+        let mut global_vertex_offset = 0;
+        let mut global_index_offset = 0;
         let mut last_tex = TextureId::from(FONT_TEX_ID);
         let context = &self.context;
         context.PSSetShaderResources(0, &[Some(self.font_resource_view.clone())]);
@@ -147,7 +147,13 @@ impl Renderer {
                 match cmd {
                     DrawCmd::Elements {
                         count,
-                        cmd_params: DrawCmdParams { clip_rect, texture_id, .. },
+                        cmd_params:
+                            DrawCmdParams {
+                                clip_rect,
+                                texture_id,
+                                vtx_offset,
+                                idx_offset,
+                            },
                     } => {
                         if texture_id != last_tex {
                             let texture = if texture_id.id() == FONT_TEX_ID {
@@ -171,18 +177,18 @@ impl Renderer {
                         context.RSSetScissorRects(&[r]);
                         context.DrawIndexed(
                             count as u32,
-                            index_offset as u32,
-                            vertex_offset as i32,
+                            (global_index_offset + idx_offset) as u32,
+                            (global_vertex_offset + vtx_offset) as i32,
                         );
-                        index_offset += count;
-                    },
+                    }
                     DrawCmd::ResetRenderState => self.setup_render_state(draw_data),
                     DrawCmd::RawCallback { callback, raw_cmd } => {
                         callback(draw_list.raw(), raw_cmd)
-                    },
+                    }
                 }
             }
-            vertex_offset += draw_list.vtx_buffer().len();
+            global_vertex_offset += draw_list.vtx_buffer().len();
+            global_index_offset += draw_list.idx_buffer().len();
         }
         Ok(())
     }
@@ -207,7 +213,13 @@ impl Renderer {
 
         ctx.RSSetViewports(&[vp]);
         ctx.IASetInputLayout(&self.input_layout);
-        ctx.IASetVertexBuffers(0, 1, &Some(self.vertex_buffer.get_buf().clone()), &stride, &0);
+        ctx.IASetVertexBuffers(
+            0,
+            1,
+            &Some(self.vertex_buffer.get_buf().clone()),
+            &stride,
+            &0,
+        );
         ctx.IASetIndexBuffer(self.index_buffer.get_buf(), draw_fmt, 0);
         ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx.VSSetShader(&self.vertex_shader, &[]);
@@ -234,7 +246,9 @@ impl Renderer {
             StructureByteStride: 0,
         };
 
-        device.CreateBuffer(&desc, null()).map(|buf| Buffer(buf, len))
+        device
+            .CreateBuffer(&desc, null())
+            .map(|buf| Buffer(buf, len))
     }
 
     unsafe fn create_index_buffer(device: &ID3D11Device, idx_count: usize) -> Result<Buffer> {
@@ -248,14 +262,18 @@ impl Renderer {
             StructureByteStride: 0,
         };
 
-        device.CreateBuffer(&desc, null()).map(|buf| Buffer(buf, len))
+        device
+            .CreateBuffer(&desc, null())
+            .map(|buf| Buffer(buf, len))
     }
 
     unsafe fn write_buffers(&self, draw_data: &DrawData) -> Result<()> {
         let vtx_resource: D3D11_MAPPED_SUBRESOURCE =
-            self.context.Map(self.vertex_buffer.get_buf(), 0, D3D11_MAP_WRITE_DISCARD, 0)?;
+            self.context
+                .Map(self.vertex_buffer.get_buf(), 0, D3D11_MAP_WRITE_DISCARD, 0)?;
         let idx_resource: D3D11_MAPPED_SUBRESOURCE =
-            self.context.Map(self.index_buffer.get_buf(), 0, D3D11_MAP_WRITE_DISCARD, 0)?;
+            self.context
+                .Map(self.index_buffer.get_buf(), 0, D3D11_MAP_WRITE_DISCARD, 0)?;
 
         let mut vtx_dst = slice::from_raw_parts_mut(
             vtx_resource.pData.cast::<DrawVert>(),
@@ -266,8 +284,9 @@ impl Renderer {
             draw_data.total_idx_count as usize,
         );
 
-        for (vbuf, ibuf) in
-            draw_data.draw_lists().map(|draw_list| (draw_list.vtx_buffer(), draw_list.idx_buffer()))
+        for (vbuf, ibuf) in draw_data
+            .draw_lists()
+            .map(|draw_list| (draw_list.vtx_buffer(), draw_list.idx_buffer()))
         {
             vtx_dst[..vbuf.len()].copy_from_slice(vbuf);
             idx_dst[..ibuf.len()].copy_from_slice(ibuf);
@@ -279,7 +298,8 @@ impl Renderer {
         self.context.Unmap(self.index_buffer.get_buf(), 0);
 
         let mapped_resource: D3D11_MAPPED_SUBRESOURCE =
-            self.context.Map(&self.constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0)?;
+            self.context
+                .Map(&self.constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0)?;
         let l = draw_data.display_pos[0];
         let r = draw_data.display_pos[0] + draw_data.display_size[0];
         let t = draw_data.display_pos[1];
@@ -308,7 +328,10 @@ impl Renderer {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE,
             ..Default::default()
@@ -405,7 +428,11 @@ impl Renderer {
 
     unsafe fn create_device_objects(
         device: &ID3D11Device,
-    ) -> Result<(ID3D11BlendState, ID3D11RasterizerState, ID3D11DepthStencilState)> {
+    ) -> Result<(
+        ID3D11BlendState,
+        ID3D11RasterizerState,
+        ID3D11DepthStencilState,
+    )> {
         let desc = D3D11_BLEND_DESC {
             AlphaToCoverageEnable: false.into(),
             IndependentBlendEnable: true.into(),
@@ -540,10 +567,16 @@ impl StateBackup {
     pub fn restore(mut self) {
         unsafe {
             let ctx = self.context.as_ref().unwrap();
-            let inst =
-                if self.ps_instances.is_some() { vec![self.ps_instances.take()] } else { vec![] };
-            let vinst =
-                if self.vs_instances.is_some() { vec![self.vs_instances.take()] } else { vec![] };
+            let inst = if self.ps_instances.is_some() {
+                vec![self.ps_instances.take()]
+            } else {
+                vec![]
+            };
+            let vinst = if self.vs_instances.is_some() {
+                vec![self.vs_instances.take()]
+            } else {
+                vec![]
+            };
 
             ctx.RSSetScissorRects(&[self.scissor_rects]);
             ctx.RSSetViewports(&[self.viewports]);

@@ -64,6 +64,8 @@ pub use wry;
 
 /// Messages received from WebView JavaScript through `window.ipc.postMessage`.
 pub type IpcHandler = Box<dyn Fn(String) + Send + 'static>;
+/// Native callback for WebView navigation lifecycle events.
+pub type PageLoadHandler = Box<dyn Fn(wry::PageLoadEvent, String) + 'static>;
 
 /// Configuration for [`Overlay`].
 pub struct OverlayConfig {
@@ -83,12 +85,15 @@ pub struct OverlayConfig {
     pub clear_color: [f32; 4],
     /// Optional WebView IPC callback.
     pub ipc_handler: Option<IpcHandler>,
-    /// Custom user-data directory for the WebView2 environment.
-    /// When `None`, WebView2 uses its default location next to the executable.
+    /// JavaScript injected before page scripts on every navigation.
+    pub initialization_script: Option<String>,
+    /// Optional callback for navigation start and finish events.
+    pub page_load_handler: Option<PageLoadHandler>,
+    /// Persistent WebView2 user-data directory. `None` uses an in-memory profile.
     pub data_directory: Option<PathBuf>,
-    /// Run the WebView in incognito / in-private mode.
+    /// Run the WebView in incognito mode (no persistent storage).
     pub incognito: bool,
-    /// Extra Chromium command-line flags passed to the WebView2 environment.
+    /// Extra Chromium command-line switches passed to WebView2.
     pub additional_browser_args: Option<String>,
 }
 
@@ -101,6 +106,8 @@ impl Default for OverlayConfig {
             respect_imgui_mouse_capture: true,
             clear_color: [0.0, 0.0, 0.0, 0.0],
             ipc_handler: None,
+            initialization_script: None,
+            page_load_handler: None,
             data_directory: None,
             incognito: false,
             additional_browser_args: None,
@@ -191,6 +198,12 @@ impl Overlay {
         use wry::WebViewBuilderExtWindows;
         if let Some(args) = config.additional_browser_args {
             builder = builder.with_additional_browser_args(args);
+        }
+        if let Some(script) = config.initialization_script {
+            builder = builder.with_initialization_script(script);
+        }
+        if let Some(handler) = config.page_load_handler {
+            builder = builder.with_on_page_load_handler(move |event, url| handler(event, url));
         }
         if let Some(handler) = config.ipc_handler {
             builder = builder.with_ipc_handler(move |request| {
