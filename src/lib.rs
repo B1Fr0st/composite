@@ -21,26 +21,32 @@ use std::{
 use imgui::{Context, DrawListMut, FontSource, TextureId, Ui};
 use imgui_dx11_renderer::Renderer;
 use thiserror::Error;
-use winapi::{
-    shared::{d3d9::*, d3d9caps::*, d3d9types::*, winerror::FAILED},
-    um::winnt::HANDLE as WinApiHandle,
-};
+use webview_texture::{FrameInfo, WebViewTexture, WebViewTextureBuilder};
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
                 D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
                 D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-                D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_FLAG, D3D11_RESOURCE_MISC_SHARED,
-                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_FLAG, D3D11_SDK_VERSION,
+                D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice,
+                ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
                 ID3D11ShaderResourceView, ID3D11Texture2D,
             },
+            DirectComposition::{
+                DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
+                IDCompositionVisual,
+            },
             Dxgi::{
-                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-                IDXGIResource,
+                Common::{
+                    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+                    DXGI_SAMPLE_DESC,
+                },
+                DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice,
+                IDXGIFactory2, IDXGISwapChain1,
             },
             Gdi::{ClientToScreen, ScreenToClient},
         },
@@ -52,19 +58,15 @@ use windows::{
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
                 GetCursorPos, GetForegroundWindow, HWND_TOPMOST, IsIconic, IsWindow,
-                IsWindowVisible, LWA_COLORKEY, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
-                SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
-                SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage, WM_QUIT,
-                WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-                WS_POPUP,
+                IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW, SetWindowPos,
+                ShowWindow, TranslateMessage, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE,
+                WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
     core::{Interface, PCWSTR},
 };
-use wio::com::ComPtr;
-
-use webview_texture::{FrameInfo, WebViewTexture, WebViewTextureBuilder};
 
 pub use imgui;
 pub use wry;
@@ -137,11 +139,6 @@ pub enum OverlayError {
     Windows(#[from] windows::core::Error),
     #[error("ImGui D3D11 renderer error: {0}")]
     ImGuiRenderer(String),
-    #[error("D3D9 {operation} failed with HRESULT 0x{hresult:08X}")]
-    D3d9 {
-        operation: &'static str,
-        hresult: u32,
-    },
 }
 
 /// Result of one composed overlay frame.
@@ -157,7 +154,7 @@ pub struct OverlayFrame {
 pub struct Overlay {
     target_hwnd: HWND,
     d3d: D3d11State,
-    presenter: D3d9Presenter,
+    presenter: CompositionPresenter,
     owned_window: OwnedOverlayWindow,
     webview: WebViewTexture,
     imgui: Context,
@@ -169,6 +166,7 @@ pub struct Overlay {
     last_frame: Instant,
     last_mouse: [i32; 2],
     last_buttons: [bool; 5],
+    active: bool,
     debug: DebugTelemetry,
 }
 
@@ -244,7 +242,7 @@ impl Overlay {
         let mut renderer = unsafe { Renderer::new(&mut imgui, &renderer_device) }
             .map_err(|error| OverlayError::ImGuiRenderer(error.to_string()))?;
         let layers = LayerResources::new(&d3d.device, &mut renderer, width, height, None)?;
-        let presenter = D3d9Presenter::new(owned_window.hwnd, width, height, &layers.combined)?;
+        let presenter = CompositionPresenter::new(&d3d.device, owned_window.hwnd, width, height)?;
         owned_window.set_visible(true);
         Ok(Self {
             target_hwnd,
@@ -261,6 +259,7 @@ impl Overlay {
             last_frame: Instant::now(),
             last_mouse: [-1, -1],
             last_buttons: [false; 5],
+            active: true,
             debug: DebugTelemetry {
                 enabled: std::env::var_os("COMPOSITE_DEBUG").is_some(),
                 last_report: Instant::now(),
@@ -287,6 +286,7 @@ impl Overlay {
             return false;
         }
         let Some((x, y, width, height)) = target_client_bounds(self.target_hwnd) else {
+            self.active = false;
             self.owned_window.set_visible(false);
             return true;
         };
@@ -296,6 +296,11 @@ impl Overlay {
                 && !IsIconic(self.target_hwnd).as_bool()
         };
         self.owned_window.sync(x, y, width, height, target_active);
+        self.active = target_active;
+        if !target_active {
+            self.last_frame = Instant::now();
+            return true;
+        }
         if (width, height) != self.window_size() && self.resize(width, height).is_err() {
             return false;
         }
@@ -346,6 +351,18 @@ impl Overlay {
     where
         F: FnOnce(&Ui, &DrawListMut<'_>),
     {
+        if !self.active {
+            std::thread::sleep(Duration::from_millis(16));
+            let (width, height) = self.window_size();
+            return Ok(OverlayFrame {
+                texture: FrameInfo {
+                    width,
+                    height,
+                    generation: self.layers.generation,
+                },
+                webview_updated: false,
+            });
+        }
         let webview_updated = if let Some(frame) = self.webview.try_render()? {
             unsafe {
                 self.d3d
@@ -390,7 +407,8 @@ impl Overlay {
             self.d3d.context.OMSetRenderTargets(None, None);
             self.d3d.context.Flush();
         }
-        self.presenter.present()?;
+        self.presenter
+            .present(&self.d3d.context, &self.layers.combined)?;
 
         if self.debug.enabled {
             self.debug.frames += 1;
@@ -436,8 +454,7 @@ impl Overlay {
         if width == 0 || height == 0 {
             return Err(OverlayError::InvalidWindowSize);
         }
-        self.presenter.release_shared_texture();
-        self.presenter.reset(width, height)?;
+        self.presenter.resize(width, height)?;
         self.webview.resize(width, height)?;
         let texture_id = self.layers.webview_texture_id;
         self.layers = LayerResources::new(
@@ -447,8 +464,6 @@ impl Overlay {
             height,
             Some(texture_id),
         )?;
-        self.presenter
-            .open_shared_texture(&self.layers.combined, width, height)?;
         self.imgui.io_mut().display_size = [width as f32, height as f32];
         Ok(())
     }
@@ -714,11 +729,7 @@ fn create_layer_texture(
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: D3D11_BIND_FLAG(bind_flags as i32).0 as u32,
         CPUAccessFlags: 0,
-        MiscFlags: if bind_flags & D3D11_BIND_RENDER_TARGET.0 as u32 != 0 {
-            D3D11_RESOURCE_MISC_SHARED.0 as u32
-        } else {
-            D3D11_RESOURCE_MISC_FLAG(0).0 as u32
-        },
+        MiscFlags: D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
     };
     let mut texture = None;
     let mut srv = None;
@@ -769,200 +780,81 @@ impl D3d11State {
     }
 }
 
-struct D3d9Presenter {
-    _d3d: ComPtr<IDirect3D9Ex>,
-    device: ComPtr<IDirect3DDevice9Ex>,
-    present_params: D3DPRESENT_PARAMETERS,
-    shared_texture: Option<ComPtr<IDirect3DTexture9>>,
+struct CompositionPresenter {
+    swap_chain: IDXGISwapChain1,
+    _composition_device: IDCompositionDevice,
+    _composition_target: IDCompositionTarget,
+    _composition_visual: IDCompositionVisual,
 }
 
-impl D3d9Presenter {
+impl CompositionPresenter {
     fn new(
+        device: &ID3D11Device,
         hwnd: HWND,
         width: u32,
         height: u32,
-        texture: &ID3D11Texture2D,
     ) -> Result<Self, OverlayError> {
-        let mut d3d_ptr = std::ptr::null_mut();
-        check_d3d9(
-            unsafe { Direct3DCreate9Ex(D3D_SDK_VERSION, &mut d3d_ptr) },
-            "Direct3DCreate9Ex",
-        )?;
-        if d3d_ptr.is_null() {
-            return Err(OverlayError::MissingObject("IDirect3D9Ex"));
-        }
-        let d3d = unsafe { ComPtr::from_raw(d3d_ptr) };
-        let mut present_params = d3d9_present_params(hwnd, width, height);
-        let mut device_ptr = std::ptr::null_mut();
-        let mut result = unsafe {
-            d3d.CreateDeviceEx(
-                D3DADAPTER_DEFAULT,
-                D3DDEVTYPE_HAL,
-                hwnd.0 as _,
-                D3DCREATE_HARDWARE_VERTEXPROCESSING,
-                &mut present_params,
-                std::ptr::null_mut(),
-                &mut device_ptr,
-            )
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let adapter = unsafe { dxgi_device.GetAdapter()? };
+        let factory: IDXGIFactory2 = unsafe { adapter.GetParent()? };
+        let description = DXGI_SWAP_CHAIN_DESC1 {
+            Width: width,
+            Height: height,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            Flags: 0,
         };
-        if FAILED(result) {
-            result = unsafe {
-                d3d.CreateDeviceEx(
-                    D3DADAPTER_DEFAULT,
-                    D3DDEVTYPE_HAL,
-                    hwnd.0 as _,
-                    D3DCREATE_SOFTWARE_VERTEXPROCESSING,
-                    &mut present_params,
-                    std::ptr::null_mut(),
-                    &mut device_ptr,
-                )
-            };
+        let swap_chain =
+            unsafe { factory.CreateSwapChainForComposition(device, &description, None)? };
+        let composition_device: IDCompositionDevice =
+            unsafe { DCompositionCreateDevice(&dxgi_device)? };
+        let composition_target = unsafe { composition_device.CreateTargetForHwnd(hwnd, true)? };
+        let composition_visual = unsafe { composition_device.CreateVisual()? };
+        unsafe {
+            composition_visual.SetContent(&swap_chain)?;
+            composition_target.SetRoot(&composition_visual)?;
+            composition_device.Commit()?;
         }
-        check_d3d9(result, "IDirect3D9Ex::CreateDeviceEx")?;
-        if device_ptr.is_null() {
-            return Err(OverlayError::MissingObject("IDirect3DDevice9Ex"));
-        }
-
-        let mut presenter = Self {
-            _d3d: d3d,
-            device: unsafe { ComPtr::from_raw(device_ptr) },
-            present_params,
-            shared_texture: None,
-        };
-        presenter.open_shared_texture(texture, width, height)?;
-        Ok(presenter)
+        Ok(Self {
+            swap_chain,
+            _composition_device: composition_device,
+            _composition_target: composition_target,
+            _composition_visual: composition_visual,
+        })
     }
 
-    fn open_shared_texture(
-        &mut self,
+    fn present(
+        &self,
+        context: &ID3D11DeviceContext,
         texture: &ID3D11Texture2D,
-        width: u32,
-        height: u32,
     ) -> Result<(), OverlayError> {
-        let resource: IDXGIResource = texture.cast()?;
-        let handle = unsafe { resource.GetSharedHandle()? };
-        let mut shared_handle = handle.0 as WinApiHandle;
-        let mut texture_ptr = std::ptr::null_mut();
-        check_d3d9(
-            unsafe {
-                self.device.CreateTexture(
-                    width,
-                    height,
-                    1,
-                    D3DUSAGE_RENDERTARGET,
-                    D3DFMT_A8R8G8B8,
-                    D3DPOOL_DEFAULT,
-                    &mut texture_ptr,
-                    &mut shared_handle,
-                )
-            },
-            "IDirect3DDevice9Ex::CreateTexture(shared)",
-        )?;
-        if texture_ptr.is_null() {
-            return Err(OverlayError::MissingObject("shared IDirect3DTexture9"));
+        let back_buffer: ID3D11Texture2D = unsafe { self.swap_chain.GetBuffer(0)? };
+        unsafe {
+            context.CopyResource(&back_buffer, texture);
+            self.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
         }
-        self.shared_texture = Some(unsafe { ComPtr::from_raw(texture_ptr) });
         Ok(())
     }
 
-    fn release_shared_texture(&mut self) {
-        self.shared_texture = None;
-    }
-
-    fn present(&self) -> Result<(), OverlayError> {
-        let texture = self
-            .shared_texture
-            .as_ref()
-            .ok_or(OverlayError::MissingObject("shared IDirect3DTexture9"))?;
-        let mut source_ptr = std::ptr::null_mut();
-        check_d3d9(
-            unsafe { texture.GetSurfaceLevel(0, &mut source_ptr) },
-            "IDirect3DTexture9::GetSurfaceLevel",
-        )?;
-        if source_ptr.is_null() {
-            return Err(OverlayError::MissingObject("shared IDirect3DSurface9"));
+    fn resize(&self, width: u32, height: u32) -> Result<(), OverlayError> {
+        unsafe {
+            self.swap_chain.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            )?;
         }
-        let source = unsafe { ComPtr::from_raw(source_ptr) };
-
-        let mut back_buffer_ptr = std::ptr::null_mut();
-        check_d3d9(
-            unsafe {
-                self.device
-                    .GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &mut back_buffer_ptr)
-            },
-            "IDirect3DDevice9Ex::GetBackBuffer",
-        )?;
-        if back_buffer_ptr.is_null() {
-            return Err(OverlayError::MissingObject("D3D9 back buffer"));
-        }
-        let back_buffer = unsafe { ComPtr::from_raw(back_buffer_ptr) };
-
-        check_d3d9(
-            unsafe {
-                self.device.StretchRect(
-                    source.as_raw(),
-                    std::ptr::null(),
-                    back_buffer.as_raw(),
-                    std::ptr::null(),
-                    D3DTEXF_NONE,
-                )
-            },
-            "IDirect3DDevice9Ex::StretchRect",
-        )?;
-        check_d3d9(
-            unsafe {
-                self.device.PresentEx(
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    0,
-                )
-            },
-            "IDirect3DDevice9Ex::PresentEx",
-        )
-    }
-
-    fn reset(&mut self, width: u32, height: u32) -> Result<(), OverlayError> {
-        self.release_shared_texture();
-        self.present_params.BackBufferWidth = width;
-        self.present_params.BackBufferHeight = height;
-        check_d3d9(
-            unsafe {
-                self.device
-                    .ResetEx(&mut self.present_params, std::ptr::null_mut())
-            },
-            "IDirect3DDevice9Ex::ResetEx",
-        )
-    }
-}
-
-fn d3d9_present_params(hwnd: HWND, width: u32, height: u32) -> D3DPRESENT_PARAMETERS {
-    D3DPRESENT_PARAMETERS {
-        BackBufferWidth: width,
-        BackBufferHeight: height,
-        BackBufferFormat: D3DFMT_A8R8G8B8,
-        BackBufferCount: 1,
-        MultiSampleType: D3DMULTISAMPLE_NONE,
-        MultiSampleQuality: 0,
-        SwapEffect: D3DSWAPEFFECT_DISCARD,
-        hDeviceWindow: hwnd.0 as _,
-        Windowed: 1,
-        EnableAutoDepthStencil: 0,
-        AutoDepthStencilFormat: D3DFMT_UNKNOWN,
-        Flags: 0,
-        FullScreen_RefreshRateInHz: 0,
-        PresentationInterval: D3DPRESENT_INTERVAL_IMMEDIATE,
-    }
-}
-
-fn check_d3d9(result: i32, operation: &'static str) -> Result<(), OverlayError> {
-    if FAILED(result) {
-        Err(OverlayError::D3d9 {
-            operation,
-            hresult: result as u32,
-        })
-    } else {
         Ok(())
     }
 }
@@ -1021,7 +913,7 @@ impl OwnedOverlayWindow {
         }
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
                 PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
                 PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
                 WS_POPUP,
@@ -1036,10 +928,6 @@ impl OwnedOverlayWindow {
             )?
         };
         unsafe {
-            // D3D9Ex presents an opaque back buffer. Treat the composition
-            // clear color (black) as transparent for this temporary owned
-            // window backend while leaving all rendered colors visible.
-            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_COLORKEY)?;
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
