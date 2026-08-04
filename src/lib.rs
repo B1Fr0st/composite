@@ -48,7 +48,7 @@ use windows::{
                 DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice,
                 IDXGIFactory2, IDXGISwapChain1,
             },
-            Gdi::{ClientToScreen, ScreenToClient},
+            Gdi::ScreenToClient,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -56,12 +56,14 @@ use windows::{
                 GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-                GetCursorPos, GetForegroundWindow, HWND_TOPMOST, IsIconic, IsWindow,
-                IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE,
-                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW, SetWindowPos,
-                ShowWindow, TranslateMessage, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE,
-                WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
+                GWL_STYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+                HTTRANSPARENT, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible,
+                LoadCursorW, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW, SetParent,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_NCHITTEST,
+                WM_QUIT, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+                WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -127,8 +129,10 @@ impl Default for OverlayConfig {
 /// Errors returned by the D3D11/WebView/ImGui overlay pipeline.
 #[derive(Debug, Error)]
 pub enum OverlayError {
-    #[error("the foreground target window was not found")]
+    #[error("the Discord overlay window was not found")]
     DiscordWindowNotFound,
+    #[error("the foreground target window was not found")]
+    ForegroundWindowNotFound,
     #[error("the foreground target window has an invalid client size")]
     InvalidWindowSize,
     #[error("a Windows API returned no object for {0}")]
@@ -153,6 +157,7 @@ pub struct OverlayFrame {
 /// Ready-to-use owned overlay renderer.
 pub struct Overlay {
     target_hwnd: HWND,
+    focus_hwnd: HWND,
     d3d: D3d11State,
     presenter: CompositionPresenter,
     owned_window: OwnedOverlayWindow,
@@ -201,13 +206,13 @@ impl Overlay {
         config: OverlayConfig,
         ipc_queue: Option<Arc<Mutex<Vec<String>>>>,
     ) -> Result<Self, OverlayError> {
-        let target_hwnd = unsafe { GetForegroundWindow() };
-        if target_hwnd.is_invalid() {
-            return Err(OverlayError::DiscordWindowNotFound);
+        let focus_hwnd = unsafe { GetForegroundWindow() };
+        if focus_hwnd.is_invalid() {
+            return Err(OverlayError::ForegroundWindowNotFound);
         }
-        let (x, y, width, height) =
-            target_client_bounds(target_hwnd).ok_or(OverlayError::InvalidWindowSize)?;
-        let mut owned_window = OwnedOverlayWindow::new(x, y, width, height)?;
+        let target_hwnd = find_discord_window()?;
+        let (width, height) = client_size(target_hwnd).ok_or(OverlayError::InvalidWindowSize)?;
+        let mut owned_window = OwnedOverlayWindow::new(target_hwnd, width, height)?;
         let d3d = D3d11State::new()?;
 
         let mut web_context = wry::WebContext::new(config.data_directory);
@@ -246,6 +251,7 @@ impl Overlay {
         owned_window.set_visible(true);
         Ok(Self {
             target_hwnd,
+            focus_hwnd,
             d3d,
             presenter,
             owned_window,
@@ -282,20 +288,24 @@ impl Overlay {
             }
         }
 
-        if !unsafe { IsWindow(Some(self.target_hwnd)).as_bool() } {
+        if !unsafe {
+            IsWindow(Some(self.target_hwnd)).as_bool() && IsWindow(Some(self.focus_hwnd)).as_bool()
+        } {
             return false;
         }
-        let Some((x, y, width, height)) = target_client_bounds(self.target_hwnd) else {
+        let Some((width, height)) = client_size(self.target_hwnd) else {
             self.active = false;
             self.owned_window.set_visible(false);
             return true;
         };
         let target_active = unsafe {
-            GetForegroundWindow() == self.target_hwnd
+            GetForegroundWindow() == self.focus_hwnd
+                && IsWindowVisible(self.focus_hwnd).as_bool()
+                && !IsIconic(self.focus_hwnd).as_bool()
                 && IsWindowVisible(self.target_hwnd).as_bool()
                 && !IsIconic(self.target_hwnd).as_bool()
         };
-        self.owned_window.sync(x, y, width, height, target_active);
+        self.owned_window.sync(width, height, target_active);
         self.active = target_active;
         if !target_active {
             self.last_frame = Instant::now();
@@ -890,13 +900,16 @@ struct OwnedOverlayWindow {
 }
 
 impl OwnedOverlayWindow {
-    fn new(x: i32, y: i32, width: u32, height: u32) -> Result<Self, OverlayError> {
+    fn new(parent: HWND, width: u32, height: u32) -> Result<Self, OverlayError> {
         unsafe extern "system" fn window_proc(
             hwnd: HWND,
             message: u32,
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
+            if message == WM_NCHITTEST {
+                return LRESULT(HTTRANSPARENT as isize);
+            }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
 
@@ -905,6 +918,7 @@ impl OwnedOverlayWindow {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
             lpszClassName: PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
             ..Default::default()
         };
@@ -913,12 +927,12 @@ impl OwnedOverlayWindow {
         }
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+                WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
                 PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
                 PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
                 WS_POPUP,
-                x,
-                y,
+                0,
+                0,
                 width as i32,
                 height as i32,
                 None,
@@ -928,11 +942,18 @@ impl OwnedOverlayWindow {
             )?
         };
         unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                ((style & !WS_POPUP.0) | WS_CHILD.0) as isize,
+            );
+            SetParent(hwnd, Some(parent))?;
             SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
-                x,
-                y,
+                Some(HWND_TOP),
+                0,
+                0,
                 width as i32,
                 height as i32,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
@@ -944,13 +965,13 @@ impl OwnedOverlayWindow {
         })
     }
 
-    fn sync(&mut self, x: i32, y: i32, width: u32, height: u32, visible: bool) {
+    fn sync(&mut self, width: u32, height: u32, visible: bool) {
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
-                x,
-                y,
+                Some(HWND_TOP),
+                0,
+                0,
                 width as i32,
                 height as i32,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER,
@@ -978,7 +999,58 @@ impl Drop for OwnedOverlayWindow {
     }
 }
 
-fn target_client_bounds(hwnd: HWND) -> Option<(i32, i32, u32, u32)> {
+const DISCORD_OVERLAY_CLASS: &[u16] = &[
+    b'C' as u16,
+    b'h' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b'm' as u16,
+    b'e' as u16,
+    b'_' as u16,
+    b'W' as u16,
+    b'i' as u16,
+    b'd' as u16,
+    b'g' as u16,
+    b'e' as u16,
+    b't' as u16,
+    b'W' as u16,
+    b'i' as u16,
+    b'n' as u16,
+    b'_' as u16,
+    b'1' as u16,
+    0,
+];
+
+const DISCORD_OVERLAY_TITLE: &[u16] = &[
+    b'D' as u16,
+    b'i' as u16,
+    b's' as u16,
+    b'c' as u16,
+    b'o' as u16,
+    b'r' as u16,
+    b'd' as u16,
+    b' ' as u16,
+    b'O' as u16,
+    b'v' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'l' as u16,
+    b'a' as u16,
+    b'y' as u16,
+    0,
+];
+
+fn find_discord_window() -> Result<HWND, OverlayError> {
+    unsafe {
+        FindWindowW(
+            PCWSTR(DISCORD_OVERLAY_CLASS.as_ptr()),
+            PCWSTR(DISCORD_OVERLAY_TITLE.as_ptr()),
+        )
+        .map_err(|_| OverlayError::DiscordWindowNotFound)
+    }
+}
+
+fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
     let mut rect = RECT::default();
     unsafe { GetClientRect(hwnd, &mut rect).ok()? };
     let width = (rect.right - rect.left).max(0) as u32;
@@ -986,13 +1058,7 @@ fn target_client_bounds(hwnd: HWND) -> Option<(i32, i32, u32, u32)> {
     if width == 0 || height == 0 {
         return None;
     }
-    let mut origin = POINT { x: 0, y: 0 };
-    unsafe {
-        if !ClientToScreen(hwnd, &mut origin).as_bool() {
-            return None;
-        }
-    }
-    Some((origin.x, origin.y, width, height))
+    Some((width, height))
 }
 
 unsafe fn key_down(key: u16) -> bool {
