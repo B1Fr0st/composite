@@ -1,4 +1,7 @@
-use std::num::NonZeroIsize;
+use std::{
+    num::NonZeroIsize,
+    time::{Duration, Instant},
+};
 
 use raw_window_handle::{
     HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
@@ -289,6 +292,10 @@ struct CaptureState {
     width: u32,
     height: u32,
     generation: u64,
+    debug_enabled: bool,
+    debug_last_report: Instant,
+    debug_frames: u64,
+    debug_wrong_size: u64,
 }
 
 impl CaptureState {
@@ -333,6 +340,10 @@ impl CaptureState {
             width,
             height,
             generation: 0,
+            debug_enabled: std::env::var_os("COMPOSITE_DEBUG").is_some(),
+            debug_last_report: Instant::now(),
+            debug_frames: 0,
+            debug_wrong_size: 0,
         })
     }
 
@@ -352,11 +363,23 @@ impl CaptureState {
                     self.context.CopyResource(&self.texture, &source);
                 }
                 self.generation = self.generation.wrapping_add(1);
+                self.debug_frames += 1;
                 copied = true;
+            } else {
+                self.debug_wrong_size += 1;
             }
             let _ = frame.Close();
         }
 
+        if self.debug_enabled && self.debug_last_report.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "[composite debug] capture copied={} wrong_size={} generation={} expected={}x{}",
+                self.debug_frames, self.debug_wrong_size, self.generation, self.width, self.height,
+            );
+            self.debug_frames = 0;
+            self.debug_wrong_size = 0;
+            self.debug_last_report = Instant::now();
+        }
         Ok(copied.then(|| self.info()))
     }
 

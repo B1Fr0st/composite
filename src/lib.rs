@@ -1,4 +1,4 @@
-//! Discord overlay renderer combining Wry, ImGui, and D3D11.
+//! Owned overlay renderer combining Wry, ImGui, and D3D11.
 //!
 //! Layer order is deterministic:
 //! 1. caller primitives submitted through the underlay draw list;
@@ -15,7 +15,7 @@ pub mod webview_texture;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use imgui::{Context, DrawListMut, FontSource, TextureId, Ui};
@@ -27,33 +27,40 @@ use winapi::{
 };
 use windows::{
     Win32::{
-        Foundation::{HMODULE, HWND, POINT, RECT},
+        Foundation::{COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
                 D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_FLAG,
-                D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-                ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D,
+                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_FLAG, D3D11_RESOURCE_MISC_SHARED,
+                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+                ID3D11ShaderResourceView, ID3D11Texture2D,
             },
             Dxgi::{
                 Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
                 IDXGIResource,
             },
-            Gdi::ScreenToClient,
+            Gdi::{ClientToScreen, ScreenToClient},
         },
+        System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
             },
             WindowsAndMessaging::{
-                DispatchMessageW, FindWindowA, GetClientRect, GetCursorPos, MSG, PM_REMOVE,
-                PeekMessageW, TranslateMessage, WM_QUIT,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+                GetCursorPos, GetForegroundWindow, HWND_TOPMOST, IsIconic, IsWindow,
+                IsWindowVisible, LWA_COLORKEY, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
+                SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
+                SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage, WM_QUIT,
+                WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+                WS_POPUP,
             },
         },
     },
-    core::{Interface, PCSTR},
+    core::{Interface, PCWSTR},
 };
 use wio::com::ComPtr;
 
@@ -80,7 +87,7 @@ pub struct OverlayConfig {
     pub respect_imgui_mouse_capture: bool,
     /// Color used to clear the combined texture before drawing its layers.
     ///
-    /// Keep alpha at `0.0` for a transparent Discord overlay. An alpha of
+    /// Keep alpha at `0.0` for a transparent overlay. An alpha of
     /// `1.0` intentionally makes every otherwise-empty pixel opaque.
     pub clear_color: [f32; 4],
     /// Optional WebView IPC callback.
@@ -118,9 +125,9 @@ impl Default for OverlayConfig {
 /// Errors returned by the D3D11/WebView/ImGui overlay pipeline.
 #[derive(Debug, Error)]
 pub enum OverlayError {
-    #[error("Discord Overlay window was not found")]
+    #[error("the foreground target window was not found")]
     DiscordWindowNotFound,
-    #[error("Discord Overlay has an invalid client size")]
+    #[error("the foreground target window has an invalid client size")]
     InvalidWindowSize,
     #[error("a Windows API returned no object for {0}")]
     MissingObject(&'static str),
@@ -146,11 +153,12 @@ pub struct OverlayFrame {
     pub webview_updated: bool,
 }
 
-/// Ready-to-use Discord overlay renderer.
+/// Ready-to-use owned overlay renderer.
 pub struct Overlay {
-    hwnd: HWND,
+    target_hwnd: HWND,
     d3d: D3d11State,
     presenter: D3d9Presenter,
+    owned_window: OwnedOverlayWindow,
     webview: WebViewTexture,
     imgui: Context,
     renderer: Renderer,
@@ -161,10 +169,19 @@ pub struct Overlay {
     last_frame: Instant,
     last_mouse: [i32; 2],
     last_buttons: [bool; 5],
+    debug: DebugTelemetry,
+}
+
+struct DebugTelemetry {
+    enabled: bool,
+    last_report: Instant,
+    frames: u64,
+    webview_updates: u64,
 }
 
 impl Overlay {
-    /// Find Discord's overlay window and initialize Wry, ImGui, and D3D11.
+    /// Capture the foreground target and initialize the owned window, Wry,
+    /// ImGui, and D3D11.
     pub fn new(config: OverlayConfig) -> Result<Self, OverlayError> {
         Self::build(config, None)
     }
@@ -186,8 +203,13 @@ impl Overlay {
         config: OverlayConfig,
         ipc_queue: Option<Arc<Mutex<Vec<String>>>>,
     ) -> Result<Self, OverlayError> {
-        let hwnd = find_discord_window()?;
-        let (width, height) = client_size(hwnd).ok_or(OverlayError::InvalidWindowSize)?;
+        let target_hwnd = unsafe { GetForegroundWindow() };
+        if target_hwnd.is_invalid() {
+            return Err(OverlayError::DiscordWindowNotFound);
+        }
+        let (x, y, width, height) =
+            target_client_bounds(target_hwnd).ok_or(OverlayError::InvalidWindowSize)?;
+        let mut owned_window = OwnedOverlayWindow::new(x, y, width, height)?;
         let d3d = D3d11State::new()?;
 
         let mut web_context = wry::WebContext::new(config.data_directory);
@@ -222,11 +244,13 @@ impl Overlay {
         let mut renderer = unsafe { Renderer::new(&mut imgui, &renderer_device) }
             .map_err(|error| OverlayError::ImGuiRenderer(error.to_string()))?;
         let layers = LayerResources::new(&d3d.device, &mut renderer, width, height, None)?;
-        let presenter = D3d9Presenter::new(hwnd, width, height, &layers.combined)?;
+        let presenter = D3d9Presenter::new(owned_window.hwnd, width, height, &layers.combined)?;
+        owned_window.set_visible(true);
         Ok(Self {
-            hwnd,
+            target_hwnd,
             d3d,
             presenter,
+            owned_window,
             webview,
             imgui,
             renderer,
@@ -237,10 +261,16 @@ impl Overlay {
             last_frame: Instant::now(),
             last_mouse: [-1, -1],
             last_buttons: [false; 5],
+            debug: DebugTelemetry {
+                enabled: std::env::var_os("COMPOSITE_DEBUG").is_some(),
+                last_report: Instant::now(),
+                frames: 0,
+                webview_updates: 0,
+            },
         })
     }
 
-    /// Pump messages, synchronize Discord's size, and update ImGui/WebView input.
+    /// Pump messages, synchronize target geometry/focus, and update input.
     pub fn start_render(&mut self) -> bool {
         unsafe {
             let mut message = MSG::default();
@@ -253,16 +283,27 @@ impl Overlay {
             }
         }
 
-        let Some((width, height)) = client_size(self.hwnd) else {
+        if !unsafe { IsWindow(Some(self.target_hwnd)).as_bool() } {
             return false;
+        }
+        let Some((x, y, width, height)) = target_client_bounds(self.target_hwnd) else {
+            self.owned_window.set_visible(false);
+            return true;
         };
+        let target_active = unsafe {
+            GetForegroundWindow() == self.target_hwnd
+                && IsWindowVisible(self.target_hwnd).as_bool()
+                && !IsIconic(self.target_hwnd).as_bool()
+        };
+        self.owned_window.sync(x, y, width, height, target_active);
         if (width, height) != self.window_size() && self.resize(width, height).is_err() {
             return false;
         }
 
         let mut point = POINT::default();
         unsafe {
-            if GetCursorPos(&mut point).is_err() || !ScreenToClient(self.hwnd, &mut point).as_bool()
+            if GetCursorPos(&mut point).is_err()
+                || !ScreenToClient(self.owned_window.hwnd, &mut point).as_bool()
             {
                 return false;
             }
@@ -338,6 +379,9 @@ impl Overlay {
         }
         drop(underlay);
         let draw_data = ui.render();
+        let draw_lists = draw_data.draw_lists_count();
+        let vertices = draw_data.total_vtx_count;
+        let indices = draw_data.total_idx_count;
         self.renderer
             .render(draw_data)
             .map_err(|error| OverlayError::ImGuiRenderer(error.to_string()))?;
@@ -347,6 +391,35 @@ impl Overlay {
             self.d3d.context.Flush();
         }
         self.presenter.present()?;
+
+        if self.debug.enabled {
+            self.debug.frames += 1;
+            self.debug.webview_updates += u64::from(webview_updated);
+            if self.debug.last_report.elapsed() >= Duration::from_secs(1) {
+                let pixels = debug_texture_stats(
+                    &self.d3d.device,
+                    &self.d3d.context,
+                    &self.layers.combined,
+                    width as u32,
+                    height as u32,
+                );
+                eprintln!(
+                    "[composite debug] render frames={} webview_updates={} generation={} size={}x{} has_webview={} draw_lists={} vertices={} indices={} present=ok pixels={pixels:?}",
+                    self.debug.frames,
+                    self.debug.webview_updates,
+                    self.layers.generation,
+                    width as u32,
+                    height as u32,
+                    self.layers.has_webview_frame,
+                    draw_lists,
+                    vertices,
+                    indices,
+                );
+                self.debug.frames = 0;
+                self.debug.webview_updates = 0;
+                self.debug.last_report = Instant::now();
+            }
+        }
 
         Ok(OverlayFrame {
             texture: FrameInfo {
@@ -451,7 +524,7 @@ impl Overlay {
         Ok(())
     }
 
-    /// Run until Discord or the message loop exits, without custom drawing.
+    /// Run until the target or message loop exits, without custom drawing.
     pub fn run(mut self) {
         while self.start_render() {
             if self.render(|_, _| {}).is_err() {
@@ -511,6 +584,56 @@ impl Overlay {
             })
             .unwrap_or_default()
     }
+}
+
+fn debug_texture_stats(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
+) -> Result<(u64, u64, u8, u8), windows::core::Error> {
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut staging = None;
+    unsafe { device.CreateTexture2D(&description, None, Some(&mut staging))? };
+    let staging = staging.ok_or_else(windows::core::Error::from_win32)?;
+    unsafe { context.CopyResource(&staging, texture) };
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+    let mut nonzero_alpha = 0_u64;
+    let mut nonzero_rgb = 0_u64;
+    let mut min_alpha = u8::MAX;
+    let mut max_alpha = u8::MIN;
+    for y in 0..height as usize {
+        let row = unsafe {
+            std::slice::from_raw_parts(
+                (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                width as usize * 4,
+            )
+        };
+        for pixel in row.chunks_exact(4) {
+            nonzero_rgb += u64::from(pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0);
+            nonzero_alpha += u64::from(pixel[3] != 0);
+            min_alpha = min_alpha.min(pixel[3]);
+            max_alpha = max_alpha.max(pixel[3]);
+        }
+    }
+    unsafe { context.Unmap(&staging, 0) };
+    Ok((nonzero_rgb, nonzero_alpha, min_alpha, max_alpha))
 }
 
 struct LayerResources {
@@ -844,22 +967,144 @@ fn check_d3d9(result: i32, operation: &'static str) -> Result<(), OverlayError> 
     }
 }
 
-fn find_discord_window() -> Result<HWND, OverlayError> {
-    unsafe {
-        FindWindowA(
-            PCSTR(c"Chrome_WidgetWin_1".as_ptr().cast()),
-            PCSTR(c"Discord Overlay".as_ptr().cast()),
-        )
-        .map_err(|_| OverlayError::DiscordWindowNotFound)
+const OWNED_OVERLAY_CLASS: &[u16] = &[
+    b'C' as u16,
+    b'o' as u16,
+    b'm' as u16,
+    b'p' as u16,
+    b'o' as u16,
+    b's' as u16,
+    b'i' as u16,
+    b't' as u16,
+    b'e' as u16,
+    b'O' as u16,
+    b'w' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'd' as u16,
+    b'O' as u16,
+    b'v' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'l' as u16,
+    b'a' as u16,
+    b'y' as u16,
+    0,
+];
+
+struct OwnedOverlayWindow {
+    hwnd: HWND,
+    visible: bool,
+}
+
+impl OwnedOverlayWindow {
+    fn new(x: i32, y: i32, width: u32, height: u32) -> Result<Self, OverlayError> {
+        unsafe extern "system" fn window_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+
+        let module = unsafe { GetModuleHandleW(None)? };
+        let instance = HINSTANCE(module.0);
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance,
+            lpszClassName: PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
+            ..Default::default()
+        };
+        unsafe {
+            RegisterClassW(&class);
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
+                PCWSTR(OWNED_OVERLAY_CLASS.as_ptr()),
+                WS_POPUP,
+                x,
+                y,
+                width as i32,
+                height as i32,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?
+        };
+        unsafe {
+            // D3D9Ex presents an opaque back buffer. Treat the composition
+            // clear color (black) as transparent for this temporary owned
+            // window backend while leaving all rendered colors visible.
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_COLORKEY)?;
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width as i32,
+                height as i32,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+            )?;
+        }
+        Ok(Self {
+            hwnd,
+            visible: true,
+        })
+    }
+
+    fn sync(&mut self, x: i32, y: i32, width: u32, height: u32, visible: bool) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width as i32,
+                height as i32,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+        self.set_visible(visible);
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        if self.visible == visible {
+            return;
+        }
+        unsafe {
+            let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
+        self.visible = visible;
     }
 }
 
-fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
+impl Drop for OwnedOverlayWindow {
+    fn drop(&mut self) {
+        if !self.hwnd.is_invalid() {
+            let _ = unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+}
+
+fn target_client_bounds(hwnd: HWND) -> Option<(i32, i32, u32, u32)> {
     let mut rect = RECT::default();
     unsafe { GetClientRect(hwnd, &mut rect).ok()? };
     let width = (rect.right - rect.left).max(0) as u32;
     let height = (rect.bottom - rect.top).max(0) as u32;
-    (width > 0 && height > 0).then_some((width, height))
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe {
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return None;
+        }
+    }
+    Some((origin.x, origin.y, width, height))
 }
 
 unsafe fn key_down(key: u16) -> bool {
